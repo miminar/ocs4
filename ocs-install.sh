@@ -44,6 +44,13 @@ function log()  {
     "$@";
 }
 
+function die() {
+    local red=`tput setaf 1`
+    local reset=`tput sgr0`
+    ( echo -n "$red"; echo -n "FATAL: "; echo -n "$@"; echo "${reset}"; ) >&2
+    exit 1
+}
+
 function getStorageClass() {
     local name_filter="${1:-}"
     local scs
@@ -131,15 +138,13 @@ function uninstall() {
     done ||:
     oc get storagecluster --all-namespaces -o name | xargs -n 1 -r oc delete    ||:
     oc get cephcluster --all-namespaces -o name    | xargs -n 1 -r oc delete    ||:
-    sleep 1
+    oc delete project openshift-storage &
     oc get csv -o name --all-namespaces -o name | grep ocs-oper | xargs -n 1 -r oc delete ||:
-    sleep 1
     oc delete --all ds -n openshift-storage         ||:
     oc delete --all deploy -n openshift-storage     ||:
-    sleep 1
     oc get pods -o name -n openshift-storage | xargs -n 1 -r oc delete --force --grace-period=0 ||:
+    oc get pvcs -o name -n openshift-storage | xargs -n 1 -r oc delete ||:
     oc delete --wait project openshift-storage      ||:
-    sleep 1
     oc get sc | awk '/\.csi\.ceph\.com/{print $1}'  | xargs -n 1 -r -i oc delete 'sc/{}' ||:
     oc get pv | awk '/noobaa/{print $1}'            | xargs -n 1 -r -i oc delete 'pv/{}' ||:
 
@@ -155,6 +160,15 @@ function uninstall() {
     for crd in `oc get crd -o name | grep 'ceph\|ocs\|rook\|noobaa\|object' ||:`; do
         oc delete $crd ||:
     done
+}
+
+function checkPrerequisites() {
+    local out="$(oc get -o name nodes -l cluster.ocs.openshift.io/openshift-storage)"
+    local cnt="$(wc -l <<<"$out")"
+    if [[ "$cnt" -lt 3 ]]; then
+        die "Number of ocs nodes is less than needed: $cnt < 3! Make sure to label at least 3" \
+            "nodes with cluster.ocs.openshift.io/openshift-storage=''"
+    fi
 }
 
 
@@ -195,10 +209,12 @@ while true; do
     esac
 done
 
-if [[ "${UNINSTALL:0}" == 1 ]]; then
+if [[ "${UNINSTALL:-0}" == 1 ]]; then
     uninstall
     exit 0
 fi
+
+[[ -z "${OCS_RELEASE:-}" ]] && OCS_RELEASE="${DEFAULT_OCS_RELEASE}"
 
 branch=master
 if [[ "${OCS_RELEASE:-latest}" =~ ^(latest|master)$ ]]; then
@@ -206,6 +222,8 @@ if [[ "${OCS_RELEASE:-latest}" =~ ^(latest|master)$ ]]; then
 else
     branch="release-${OCS_RELEASE}"
 fi
+
+checkPrerequisites
 
 oc get crd ocsinitializations.ocs.openshift.io 2>/dev/null || \
     oc create -f https://raw.githubusercontent.com/openshift/ocs-operator/$branch/deploy/crds/ocs_v1_ocsinitialization_crd.yaml
