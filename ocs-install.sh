@@ -5,6 +5,7 @@ IFS=$'\n\t'
 
 readonly DEFAULT_OSD_PV_SIZE="200Gi"
 readonly DEFAULT_OCS_RELEASE=4.2
+readonly DELETE_TIMEOUT=10s
 
 USAGE="$(basename "${BASH_SOURCE[0]}") [-h]
 
@@ -20,21 +21,25 @@ Options:
                 OCS release to deploy. Defaults to ${DEFAULT_OCS_RELEASE}.
   (-u | --uninstall)
                 Uninstall existing OCS deployment.
+  (-t | --timeout) DELETE_TIMEOUT
+                Timeout for oc delete. Defaults to ${DELETE_TIMEOUT}
 "
 
-readonly long_options=(
+readonly longOptions=(
     osd-pv-size:
     ocs-release:
     uninstall
+    timeout:
 )
 
 function join() { local IFS="$1"; shift 1; echo "$*"; }
 
 function log()  {
     local v
-    local red=`tput setaf 1`
-    local green=`tput setaf 2`
-    local reset=`tput sgr0`
+    local red green reset
+    red="$(tput setaf 1)"
+    green="$(tput setaf 2)"
+    reset="$(tput sgr0)"
     if [[ $# == 2 && "${1:-}" == "export" && ! "${2:-}" =~ "=" ]]; then
         eval "v=\$${2:-}"
         echo "${green}export $2='${v:-}'${reset}" >&2
@@ -45,8 +50,9 @@ function log()  {
 }
 
 function die() {
-    local red=`tput setaf 1`
-    local reset=`tput sgr0`
+    local red reset
+    red="$(tput setaf 1)"
+    reset="$(tput sgr0)"
     ( echo -n "$red"; echo -n "FATAL: "; echo -n "$@"; echo "${reset}"; ) >&2
     exit 1
 }
@@ -59,7 +65,8 @@ function getStorageClass() {
     else
         scs="$(oc get sc | sed -n 's/^\([^[:space:]]\+\)\s\+(default).*/\1/p' | grep -v ocs)"
     fi
-    local sc="$(head -n 1 <<<"${scs}")"
+    local sc
+    sc="$(head -n 1 <<<"${scs}")"
     if [[ -z "${sc:-}" ]]; then
         sc="$(oc get sc -o name | grep -v ocs | head -n 1 ||:)"
     fi
@@ -73,38 +80,75 @@ function getStorageClass() {
     printf '%s\n' "${sc:-}"
 }
 
-function uninstall() {
-    oc delete -n openshift-storage     subscription/ocs-subscription            ||:
-    oc delete -n openshift-marketplace catalogsource ocs-catalogsource          ||:
-    for cc in `oc get cephclusters.ceph.rook.io -o name`; do
-        oc patch $cc --type=merge -p '{"metadata": {"finalizers":null}}' ||:
-    done ||:
-    oc get storagecluster --all-namespaces -o name | xargs -n 1 -r oc delete    ||:
-    oc get cephcluster --all-namespaces -o name    | xargs -n 1 -r oc delete    ||:
-    sleep 1
-    oc get csv -o name --all-namespaces -o name | grep ocs-oper | xargs -n 1 -r oc delete ||:
-    sleep 1
-    oc delete --all ds -n openshift-storage         ||:
-    oc delete --all deploy -n openshift-storage     ||:
-    sleep 1
-    oc get pods -o name -n openshift-storage | xargs -n 1 -r oc delete --force --grace-period=0 ||:
-    oc delete --wait project openshift-storage      ||:
-    sleep 1
-    oc get sc | awk '/\.csi\.ceph\.com/{print $1}'  | xargs -n 1 -r -i oc delete 'sc/{}' ||:
-    oc get pv | awk '/noobaa/{print $1}'            | xargs -n 1 -r -i oc delete 'pv/{}' ||:
+function forceDeleteResource() {
+    local crd="$1"
+    local nm="$2"
+    local name="$3"
+    oc patch -n "$nm" "$crd/$name" --type merge -p '{"metadata":{"finalizers":null}}'
+    oc delete --timeout 21s --wait -n "$nm" "$crd/$name" ||:
+    if ! oc get -n "$nm" "$crd/$name" >/dev/null 2>&1; then
+        return 0
+    fi
+    oc delete --timeout 21s --wait --force --grace-period=0 -n "$nm" "$crd/$name"
+}
+export -f forceDeleteResource
 
-    for r in `oc get crd | awk '/ceph|ocs|rook|noobaa|object/{print $1}' ||:`; do
-        oc get $r --all-namespaces -o name | xargs -n 1 -r oc delete ||:
-    done ||:
+function deleteCRD() {
+    set -x
+    local crd="$1"
+    local resources=()
+    local rsnm nm name
+
+    # we expect all the resources to be namespaces
+    readarray -t resources <<<"$(oc get --all-namespaces "$crd" \
+            -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' ||:)"
+    if [[ "${#resources[@]}" -gt 1 || ( "${#resources[@]}" == 1 && -n "${resources[0]:-}" ) ]]; then
+        for rsnm in "${resources[@]}"; do
+            if [[ -z "${rsnm:-}" ]]; then
+                printf 'empty rsnm!\n' >&2
+                continue
+            fi
+            IFS=/ read -r nm name <<<"${rsnm}"
+            parallel --semaphore --id "del-$crd" \
+                oc delete --timeout 21s --wait -n "$nm" "$crd/$name"
+        done
+        parallel --semaphore --id "del-$crd" --wait ||:
+
+        readarray -t resources <<<"$(oc get --all-namespaces "$crd" \
+            -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' ||:)"
+        if [[ "${#resources[@]}" -gt 1 || ( "${#resources[@]}" == 1 && -n "${resources[0]:-}" ) ]]; then
+            for rsnm in "${resources[@]}"; do
+                if [[ -z "${rsnm:-}" ]]; then
+                    printf 'empty rsnm!\n' >&2
+                    continue
+                fi
+                IFS=/ read -r nm name <<<"${rsnm}"
+                parallel --semaphore --id "del-$crd" forceDeleteResource "$crd" "$nm" "$name"
+            done
+            parallel --semaphore --id "del-$crd" --wait ||:
+        fi
+    fi
+
+    oc delete --timeout 21s --wait "crd/$crd"
+}
+export -f deleteCRD
+
+function uninstall() {
+    local crds=()
+    oc delete -n openshift-storage     --timeout=10s  subscription/ocs-subscription            ||:
+    oc delete -n openshift-marketplace --timeout=10s  catalogsource ocs-catalogsource          ||:
+    parallel oc patch "{}" --type=merge -p '{"metadata": {"finalizers":null}}' \
+        <<<"$(oc get cephclusters.ceph.rook.io -o name)" ||:
+
+    readarray -t crds <<<"$(oc get crd | awk '/ceph|ocs|rook|noobaa|objectbucket/ {print $1}')"
+    if [[ "${#crds[@]}" -gt 0 ]]; then
+        parallel deleteCRD ::: "${crds[@]}"
+    fi
 
     while oc get project openshift-storage 2>/dev/null; do
         printf 'Waiting for openshift-storage project to get deleted.\n' >&2
         sleep 1
     done ||:
-
-    for crd in `oc get crd -o name | grep 'ceph\|ocs\|rook\|noobaa\|object' ||:`; do
-        oc delete $crd ||:
-    done
 }
 
 
@@ -130,41 +174,10 @@ function getStorageClass() {
     printf '%s\n' "${sc:-}"
 }
 
-function uninstall() {
-    oc delete -n openshift-storage     subscription/ocs-subscription            ||:
-    oc delete -n openshift-marketplace catalogsource ocs-catalogsource          ||:
-    for cc in `oc get cephclusters.ceph.rook.io -o name`; do
-        oc patch $cc --type=merge -p '{"metadata": {"finalizers":null}}' ||:
-    done ||:
-    oc get storagecluster --all-namespaces -o name | xargs -n 1 -r oc delete    ||:
-    oc get cephcluster --all-namespaces -o name    | xargs -n 1 -r oc delete    ||:
-    oc delete project openshift-storage &
-    oc get csv -o name --all-namespaces -o name | grep ocs-oper | xargs -n 1 -r oc delete ||:
-    oc delete --all ds -n openshift-storage         ||:
-    oc delete --all deploy -n openshift-storage     ||:
-    oc get pods -o name -n openshift-storage | xargs -n 1 -r oc delete --force --grace-period=0 ||:
-    oc get pvcs -o name -n openshift-storage | xargs -n 1 -r oc delete ||:
-    oc delete --wait project openshift-storage      ||:
-    oc get sc | awk '/\.csi\.ceph\.com/{print $1}'  | xargs -n 1 -r -i oc delete 'sc/{}' ||:
-    oc get pv | awk '/noobaa/{print $1}'            | xargs -n 1 -r -i oc delete 'pv/{}' ||:
-
-    for r in `oc get crd | awk '/ceph|ocs|rook|noobaa|object/{print $1}' ||:`; do
-        oc get $r --all-namespaces -o name | xargs -n 1 -r oc delete ||:
-    done ||:
-
-    while oc get project openshift-storage 2>/dev/null; do
-        printf 'Waiting for openshift-storage project to get deleted.\n' >&2
-        sleep 1
-    done ||:
-
-    for crd in `oc get crd -o name | grep 'ceph\|ocs\|rook\|noobaa\|object' ||:`; do
-        oc delete $crd ||:
-    done
-}
-
 function checkPrerequisites() {
-    local out="$(oc get -o name nodes -l cluster.ocs.openshift.io/openshift-storage)"
-    local cnt="$(wc -l <<<"$out")"
+    local out cnt
+    out="$(oc get -o name nodes -l cluster.ocs.openshift.io/openshift-storage)"
+    cnt="$(wc -l <<<"$out")"
     if [[ "$cnt" -lt 3 ]]; then
         die "Number of ocs nodes is less than needed: $cnt < 3! Make sure to label at least 3" \
             "nodes with cluster.ocs.openshift.io/openshift-storage=''"
@@ -174,8 +187,8 @@ function checkPrerequisites() {
 
 OSD_PV_SIZE="$DEFAULT_OSD_PV_SIZE"
 
-TMPARGS="$(getopt -o ur:s:h --long "$(join , "${long_options[@]}")" \
-                      -n "$(basename ${BASH_SOURCE[@]})" -- "$@")"
+TMPARGS="$(getopt -o t:ur:s:h --long "$(join , "${longOptions[@]}")" \
+                      -n "$(basename "${BASH_SOURCE[@]}")" -- "$@")"
 
 eval set -- "${TMPARGS}"
 
@@ -196,6 +209,10 @@ while true; do
         ;;
     -r | --ocs-release)
         OCS_RELEASE="$2"
+        shift 2
+        ;;
+    -t | --timeout)
+        DELETE_TIMEOUT="$2"
         shift 2
         ;;
     --)
